@@ -1,0 +1,615 @@
+---
+title: "Projekt 2 – Predykcja wypożyczeń rowerów miejskich"
+subtitle: "SAD 2026L"
+author: "Magdalena Kruk, 458917"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(ggcorrplot)
+library(patchwork)
+library(ranger)
+library(glmnet)
+library(rsample)
+library(knitr)
+library(kableExtra)
+```
+
+```{r helper-functions}
+dow_monday <- function(date) {
+  ((as.POSIXlt(date)$wday + 6) %% 7) + 1
+}
+```
+
+---
+
+# 1. Podstawowa analiza danych
+
+## 1a. Wczytanie danych i braki wartości
+
+```{r load-data}
+df <- read.csv("bike_train.csv", stringsAsFactors = FALSE)
+
+# Poprawne typy zmiennych
+df <- df %>%
+  mutate(
+    date  = as.Date(date),
+    wcond = factor(wcond, levels = 1:4,
+                   labels = c("Pogodnie/lekkie zachmurzenie",
+                              "Pochmurnie/mgła",
+                              "Lekki opad",
+                              "Duży opad")),
+    # 1d: zmienna weekend
+    weekend = as.integer(dow_monday(date) >= 6)
+  ) %>%
+  select(-any_of(c("X", "Unnamed: 0", "id", "Id", "index")))  # bezpieczne usunięcie kolumny z indeksem, jeśli występuje
+
+# Sprawdzenie braków
+braki <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Zmienna", values_to = "Liczba braków")
+
+kable(braki, caption = "Liczba braków wartości w każdej zmiennej") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r missing-comment, results='asis'}
+n_missing <- sum(is.na(df))
+if (n_missing == 0) {
+  cat("**Brak brakujących wartości w zbiorze danych.** Wszystkie zmienne są kompletne – nie ma potrzeby imputacji.")
+} else {
+  cat(paste0("**Wykryto ", n_missing, " brakujących wartości.** Wiersze z brakami zostaną usunięte (complete case analysis)."))
+  df <- df %>% drop_na()
+}
+```
+
+> **Uwaga:** W danych występuje obserwacja z `hum = 0`, która może być wartością nietypową lub błędem pomiarowym. Zostaje ona zachowana, ponieważ nie jest formalnie brakiem danych, a pojedyncza obserwacja tego typu nie powinna istotnie zaburzyć wyników modeli.
+
+## 1b. Wykresy: temperatura i liczba wypożyczeń w czasie
+
+```{r plot-time-series}
+p1 <- ggplot(df, aes(x = date, y = temp)) +
+  geom_line(color = "#E07B39", linewidth = 0.7) +
+  geom_smooth(se = FALSE, color = "#8B2FC9", linewidth = 0.9, method = "loess", span = 0.2) +
+  labs(title = "Temperatura w ciągu roku 2022",
+       x = NULL, y = "Temperatura [°C]") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p2 <- ggplot(df, aes(x = date, y = count)) +
+  geom_line(color = "#3A86FF", linewidth = 0.7) +
+  geom_smooth(se = FALSE, color = "#FF006E", linewidth = 0.9, method = "loess", span = 0.2) +
+  labs(title = "Liczba wypożyczonych rowerów w ciągu roku 2022",
+       x = "Data", y = "Liczba wypożyczeń") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p1 / p2
+```
+
+Oba wykresy wykazują wyraźną **sezonowość**: szczyt wypożyczeń przypada na lato (czerwiec–sierpień), co koreluje z wyższymi temperaturami. Zimą liczba wypożyczeń spada nawet poniżej 1000 dziennie.
+
+## 1c. Macierz korelacji – mapa ciepła
+
+```{r corr-heatmap}
+vars_meteo <- df %>% select(temp, atemp, hum, wind)
+
+cor_mat <- cor(vars_meteo, use = "complete.obs")
+
+ggcorrplot(cor_mat,
+           method   = "square",
+           type     = "full",
+           lab      = TRUE,
+           lab_size = 4,
+           colors   = c("#3A86FF", "white", "#FF006E"),
+           title    = "Macierz korelacji zmiennych meteorologicznych",
+           ggtheme  = theme_minimal(base_size = 12)) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+Najsilniejsza korelacja występuje między `temp` a `atemp` (r ≈ 0.99) – obie zmienne niosą praktycznie identyczną informację. `hum` i `wind` są słabo skorelowane z temperaturą.
+
+## 1d. Zmienna `weekend`
+
+Zmienna `weekend` została dodana w sekcji wczytywania danych. Przyjmuje wartość **1** dla sobót i niedziel, **0** dla pozostałych dni.
+
+```{r weekend-summary}
+df %>%
+  count(weekend) %>%
+  mutate(weekend = ifelse(weekend == 1, "Weekend", "Dzień roboczy"),
+         Odsetek = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  rename(Typ = weekend, `Liczba dni` = n) %>%
+  kable(caption = "Rozkład zmiennej weekend") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# 2. Analiza składowych głównych (PCA)
+
+```{r pca}
+pca_data <- df %>% select(temp, atemp, hum, wind)
+
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# Wariancja wyjaśniona przez każdą składową
+var_explained <- summary(pca_result)$importance
+
+kable(var_explained, digits = 4,
+      caption = "Wariancja wyjaśniana przez składowe główne") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r pca-plot}
+var_df <- data.frame(
+  PC          = paste0("PC", 1:4),
+  Prop        = var_explained["Proportion of Variance", ],
+  Cumulative  = var_explained["Cumulative Proportion", ]
+)
+
+ggplot(var_df, aes(x = PC)) +
+  geom_col(aes(y = Prop), fill = "#3A86FF", alpha = 0.7, width = 0.5) +
+  geom_line(aes(y = Cumulative, group = 1), color = "#FF006E",
+            linewidth = 1.2, linetype = "dashed") +
+  geom_point(aes(y = Cumulative), color = "#FF006E", size = 3) +
+  geom_hline(yintercept = 0.90, linetype = "dotted", color = "gray40") +
+  annotate("text", x = 3.7, y = 0.92, label = "90%", color = "gray40", size = 3.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title    = "Odsetek wariancji wyjaśnianej przez składowe główne",
+       subtitle = "Słupki: wariancja indywidualna | Linia: kumulatywna",
+       x = "Składowa główna", y = "Odsetek wariancji") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r pca-conclusion, results='asis'}
+n_comp_90 <- which(var_explained["Cumulative Proportion", ] >= 0.90)[1]
+cum_90    <- round(var_explained["Cumulative Proportion", n_comp_90] * 100, 1)
+cat(paste0("**Minimalna liczba składowych głównych wyjaśniających co najmniej 90% sumarycznej wariancji: ",
+           n_comp_90, "** (wyjaśniają łącznie ", cum_90, "% wariancji)."))
+```
+
+---
+
+# 3. Lasy losowe
+
+## Przygotowanie danych i foldów CV
+
+```{r prepare-modeling}
+# Zmienna objaśniana i predyktory
+# wcond pozostaje faktorem, ponieważ opisuje jakościowe warunki pogodowe.
+# Z daty tworzymy dodatkowe zmienne sezonowe: dzień roku i miesiąc.
+
+df_model <- df %>%
+  mutate(
+    weekend = as.integer(weekend),
+    day_of_year = yday(date),
+    month = factor(month(date))
+  ) %>%
+  select(-date)
+
+set.seed(42)
+folds <- vfold_cv(df_model, v = 5, strata = NULL)
+
+# Pomocnicza funkcja: MSE
+mse <- function(actual, predicted) mean((actual - predicted)^2)
+```
+
+## 3a. Przeszukiwanie siatki hiperparametrów
+
+
+Wybrane hiperparametry modelu lasów losowych (`ranger`) przedstawiono w tabeli poniżej.
+
+```{r rf-param-table, echo=FALSE}
+rf_param_table <- data.frame(
+  Hiperparametr = c("num.trees", "mtry", "min.node.size"),
+  Opis = c(
+    "Liczba drzew w lesie",
+    "Liczba zmiennych losowanych przy podziale w każdym węźle",
+    "Minimalna liczba obserwacji w liściu"
+  ),
+  Zakres = c(
+    "100, 200, 300, 500",
+    "2, 3, 4, 5",
+    "2, 3, 5, 8, 10, 15, 20"
+  )
+)
+
+knitr::kable(
+  rf_param_table,
+  caption = "Siatka hiperparametrów modelu lasów losowych."
+)
+```
+
+Łącznie przeszukano $4 \times 4 \times 7 = 112$ konfiguracji hiperparametrów, czyli więcej niż wymagane minimum 100 konfiguracji.
+
+```{r rf-grid-search, cache=TRUE}
+# Siatka hiperparametrów: 4 * 4 * 7 = 112 konfiguracji, czyli co najmniej 100
+grid_rf <- expand.grid(
+  num.trees     = c(100, 200, 300, 500),
+  mtry          = c(2, 3, 4, 5),
+  min.node.size = c(2, 3, 5, 8, 10, 15, 20)
+)
+
+results_rf <- list()
+
+for (i in seq_len(nrow(grid_rf))) {
+  nt  <- grid_rf$num.trees[i]
+  mt  <- grid_rf$mtry[i]
+  mns <- grid_rf$min.node.size[i]
+
+  fold_train_mse <- numeric(5)
+  fold_val_mse   <- numeric(5)
+
+  for (f in 1:5) {
+    train_f <- training(folds$splits[[f]])
+    test_f  <- testing(folds$splits[[f]])
+
+    m <- ranger(
+      count ~ .,
+      data          = train_f,
+      num.trees     = nt,
+      mtry          = mt,
+      min.node.size = mns,
+      seed          = 42
+    )
+
+    pred_train <- predict(m, data = train_f)$predictions
+    pred_val   <- predict(m, data = test_f)$predictions
+
+    fold_train_mse[f] <- mse(train_f$count, pred_train)
+    fold_val_mse[f]   <- mse(test_f$count, pred_val)
+  }
+
+  results_rf[[i]] <- data.frame(
+    num.trees     = nt,
+    mtry          = mt,
+    min.node.size = mns,
+    train_mse     = mean(fold_train_mse),
+    val_mse       = mean(fold_val_mse)
+  )
+}
+
+rf_results <- bind_rows(results_rf)
+
+best_rf_idx <- which.min(rf_results$val_mse)
+best_rf     <- rf_results[best_rf_idx, ]
+
+# Ponowne policzenie wyników w poszczególnych foldach dla najlepszej konfiguracji.
+# Jest to potrzebne do tabelarycznego porównania modeli na tych samych foldach.
+rf_best_folds <- tibble(
+  fold = 1:5,
+  train_mse = NA_real_,
+  val_mse = NA_real_
+)
+
+for (f in 1:5) {
+  train_f <- training(folds$splits[[f]])
+  test_f  <- testing(folds$splits[[f]])
+
+  m_best_rf <- ranger(
+    count ~ .,
+    data          = train_f,
+    num.trees     = best_rf$num.trees,
+    mtry          = best_rf$mtry,
+    min.node.size = best_rf$min.node.size,
+    seed          = 42
+  )
+
+  pred_train <- predict(m_best_rf, data = train_f)$predictions
+  pred_val   <- predict(m_best_rf, data = test_f)$predictions
+
+  rf_best_folds$train_mse[f] <- mse(train_f$count, pred_train)
+  rf_best_folds$val_mse[f]   <- mse(test_f$count, pred_val)
+}
+```
+
+
+## 3b. Wykres: błąd treningowy vs. walidacyjny
+
+```{r rf-plot}
+ggplot(rf_results, aes(x = train_mse, y = val_mse)) +
+  geom_point(alpha = 0.4, color = "#3A86FF", size = 2) +
+  geom_point(data = best_rf,
+             aes(x = train_mse, y = val_mse),
+             color = "#FF006E", size = 5, shape = 18) +
+  annotate("text",
+           x = best_rf$train_mse * 1.05,
+           y = best_rf$val_mse   * 1.02,
+           label = paste0("Optimum\nval MSE = ", round(best_rf$val_mse, 0)),
+           color = "#FF006E", size = 3.5, hjust = 0) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title    = "Las losowy – błąd treningowy vs. walidacyjny (CV)",
+       subtitle = "Każdy punkt = jedna konfiguracja hiperparametrów | Romb = optimum",
+       x = "Błąd treningowy (MSE)",
+       y = "Błąd walidacyjny (MSE)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r rf-best, results='asis'}
+cat(paste0(
+  "**Optymalna konfiguracja lasów losowych:**\n\n",
+  "- `num.trees` = ", best_rf$num.trees, "\n",
+  "- `mtry` = ", best_rf$mtry, "\n",
+  "- `min.node.size` = ", best_rf$min.node.size, "\n\n",
+  "**Błąd walidacyjny (MSE) = ", round(best_rf$val_mse, 2), "**",
+  " (RMSE ≈ ", round(sqrt(best_rf$val_mse), 1), " wypożyczeń)"
+))
+```
+
+---
+
+# 4. Regresja grzbietowa (Ridge)
+
+## 4a. Walidacja krzyżowa dla siatki λ
+
+```{r ridge-cv, cache=TRUE}
+# Przygotowanie macierzy modelu
+X_all <- model.matrix(count ~ . - 1, data = df_model)
+y_all <- df_model$count
+
+# Siatka lambda – 10 wartości (zakres od 10000 do 0.01)
+lambda_grid <- 10^seq(4, -2, length.out = 10)
+
+# Wyniki per fold i per lambda
+ridge_results <- expand.grid(
+  lambda   = lambda_grid,
+  fold     = 1:5,
+  val_mse  = NA_real_
+)
+
+for (f in 1:5) {
+  idx_train <- folds$splits[[f]]$in_id
+  idx_test  <- setdiff(seq_len(nrow(df_model)), idx_train)
+
+  X_train <- X_all[idx_train, ]
+  y_train <- y_all[idx_train]
+  X_test  <- X_all[idx_test,  ]
+  y_test  <- y_all[idx_test]
+
+  for (l_idx in seq_along(lambda_grid)) {
+    lam <- lambda_grid[l_idx]
+
+    m_ridge <- glmnet(X_train, y_train, alpha = 0, lambda = lam)
+    pred    <- predict(m_ridge, newx = X_test, s = lam)
+
+    row_idx <- which(ridge_results$lambda == lam & ridge_results$fold == f)
+    ridge_results$val_mse[row_idx] <- mse(y_test, as.vector(pred))
+  }
+}
+
+# Błąd CV (uśredniony po foldach) dla każdej lambdy
+ridge_cv <- ridge_results %>%
+  group_by(lambda) %>%
+  summarise(cv_mse = mean(val_mse), .groups = "drop")
+
+best_ridge     <- ridge_cv %>% slice_min(cv_mse, n = 1, with_ties = FALSE)
+best_ridge_mse <- best_ridge$cv_mse
+best_lambda    <- best_ridge$lambda
+
+ridge_best_folds <- ridge_results %>%
+  filter(lambda == best_lambda) %>%
+  arrange(fold) %>%
+  select(fold, val_mse)
+```
+
+## 4b. Wykres: MSE w foldach i błąd CV
+
+```{r ridge-plot}
+ggplot() +
+  # punkty dla każdego foldu
+  geom_point(data = ridge_results,
+             aes(x = lambda, y = val_mse, group = factor(fold)),
+             color = "#3A86FF", alpha = 0.55, size = 2.2) +
+  # linia błędu CV
+  geom_line(data = ridge_cv,
+            aes(x = lambda, y = cv_mse),
+            color = "#FF006E", linewidth = 1.3) +
+  geom_point(data = ridge_cv,
+             aes(x = lambda, y = cv_mse),
+             color = "#FF006E", size = 2.5) +
+  # oznaczenie optimum
+  geom_vline(xintercept = best_lambda, linetype = "dashed", color = "gray40") +
+  annotate("text",
+           x     = best_lambda * 1.6,
+           y     = max(ridge_results$val_mse) * 0.95,
+           label = paste0("λ* = ", round(best_lambda, 2)),
+           color = "gray30", size = 3.5) +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title    = "Regresja grzbietowa – MSE w zależności od λ",
+       subtitle = "Niebieskie punkty: wyniki w poszczególnych foldach | Różowa linia: błąd CV",
+       x = "λ (skala logarytmiczna)",
+       y = "Błąd walidacyjny (MSE)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## 4c. Optymalne λ i porównanie z lasami losowymi
+
+```{r ridge-conclusion, results='asis'}
+cat(paste0(
+  "**Optymalne λ = ", round(best_lambda, 4), "**",
+  " przy którym błąd walidacyjny (MSE) wynosi **",
+  round(best_ridge_mse, 2), "** (RMSE ≈ ",
+  round(sqrt(best_ridge_mse), 1), " wypożyczeń).\n\n",
+  "Dla porównania, najlepszy model lasów losowych osiągnął błąd walidacyjny **",
+  round(best_rf$val_mse, 2), "** (RMSE ≈ ",
+  round(sqrt(best_rf$val_mse), 1), " wypożyczeń)."
+))
+```
+
+---
+
+# 5. Podsumowanie tabelaryczne – porównanie modeli
+
+```{r baseline-model}
+# Model bazowy: predykcja = średnia z foldów treningowych
+baseline_mse_folds <- numeric(5)
+
+for (f in 1:5) {
+  train_f <- training(folds$splits[[f]])
+  test_f  <- testing(folds$splits[[f]])
+
+  mean_train    <- mean(train_f$count)
+  pred_baseline <- rep(mean_train, nrow(test_f))
+
+  baseline_mse_folds[f] <- mse(test_f$count, pred_baseline)
+}
+
+baseline_cv_mse <- mean(baseline_mse_folds)
+
+# Tabela fold po foldzie – wszystkie modele są liczone na tych samych podziałach CV
+comparison_folds <- tibble(
+  Fold = 1:5,
+  `Model bazowy MSE` = baseline_mse_folds,
+  `Ridge MSE` = ridge_best_folds$val_mse,
+  `Random Forest MSE` = rf_best_folds$val_mse
+)
+
+comparison_folds_with_mean <- comparison_folds %>%
+  bind_rows(tibble(
+    Fold = NA_integer_,
+    `Model bazowy MSE` = mean(baseline_mse_folds),
+    `Ridge MSE` = mean(ridge_best_folds$val_mse),
+    `Random Forest MSE` = mean(rf_best_folds$val_mse)
+  )) %>%
+  mutate(Fold = ifelse(is.na(Fold), "Średnia", as.character(Fold)))
+```
+
+```{r fold-summary-table}
+kable(
+  comparison_folds_with_mean,
+  digits = 2,
+  caption = "Porównanie modeli w poszczególnych foldach walidacji krzyżowej"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(nrow(comparison_folds_with_mean), bold = TRUE, background = "#f2f2f2")
+```
+
+```{r summary-table}
+summary_df <- tibble(
+  Model = c(
+    "Model bazowy (stała = średnia treningowa)",
+    "Regresja grzbietowa (Ridge)",
+    "Lasy losowe (Random Forest)"
+  ),
+  `Błąd CV (MSE)` = c(
+    round(baseline_cv_mse, 2),
+    round(best_ridge_mse,  2),
+    round(best_rf$val_mse, 2)
+  ),
+  `RMSE` = c(
+    round(sqrt(baseline_cv_mse), 1),
+    round(sqrt(best_ridge_mse),  1),
+    round(sqrt(best_rf$val_mse), 1)
+  ),
+  `Względny błąd vs. baseline [%]` = c(
+    "–",
+    paste0(round((best_ridge_mse  / baseline_cv_mse - 1) * 100, 1), "%"),
+    paste0(round((best_rf$val_mse / baseline_cv_mse - 1) * 100, 1), "%")
+  )
+)
+
+kable(summary_df,
+      caption = "Porównanie modeli – średni wynik z 5-krotnej walidacji krzyżowej") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(which.min(c(baseline_cv_mse, best_ridge_mse, best_rf$val_mse)),
+           bold = TRUE, background = "#d4edda")
+```
+
+**Wnioski:**
+
+- Model bazowy (predykcja stałą = średnią) stanowi dolną granicę jakości – RMSE na poziomie ok. `r round(sqrt(baseline_cv_mse), 0)` wypożyczeń.
+- Regresja grzbietowa istotnie poprawia wynik względem modelu bazowego, lecz jest modelem liniowym i nie potrafi uchwycić nieliniowych zależności.
+- Lasy losowe osiągają najniższy błąd walidacyjny, co wskazuje na ich przewagę w tym zadaniu – lepiej modelują nieliniowe relacje (np. efekt wysokich temperatur latem, wpływ opadów).
+
+---
+
+# 6. Predykcja na zbiorze testowym (Kaggle)
+
+Do finalnej predykcji na zbiorze testowym wykorzystano osobny skrypt `KrukMagdalena_458917_kaggle.R`.Rozwiązanie jest modelem zespołowym, w którym wykorzystano:
+
+- dwa modele gradient boosting (`gbm`),
+- dwa modele lasów losowych (`ranger`),
+- dwa modele `xgboost`,
+- regresję grzbietową (`glmnet`, Ridge),
+- model wygładzający GAM (`mgcv`).
+
+Zmienną objaśnianą w modelach finalnych jest `log_count = log(1 + count)`, co stabilizuje wariancję i ogranicza wpływ bardzo dużych wartości liczby wypożyczeń. Po predykcji wynik jest przekształcany z powrotem do oryginalnej skali przez `exp(pred) - 1`.
+
+W finalnym skrypcie wykorzystano wyłącznie trzy pliki wejściowe:
+
+- `bike_train.csv` – dane treningowe z kolumną `count`,
+- `bike_test.csv` – dane testowe bez kolumny `count`,
+- `sample_submission.csv` – wzór formatu pliku wynikowego.
+
+
+
+```{r final-kaggle-model, eval=TRUE}
+if (file.exists("KrukMagdalena_458917_kaggle.R")) {
+  source("KrukMagdalena_458917_kaggle.R")
+  
+  if (file.exists("submission.csv")) {
+    submission_check <- read.csv("submission.csv", stringsAsFactors = FALSE)
+    sample_check <- read.csv("sample_submission.csv", stringsAsFactors = FALSE)
+    
+    stopifnot(all(c("date", "pred") %in% names(submission_check)))
+    stopifnot(nrow(submission_check) == nrow(sample_check))
+    stopifnot(!any(is.na(submission_check$pred)))
+    stopifnot(all(is.finite(submission_check$pred)))
+    stopifnot(all(submission_check$pred >= 0))
+    
+    write.csv(
+      submission_check[, c("date", "pred")],
+      "KrukMagdalena_458917_submission.csv",
+      row.names = FALSE
+    )
+    
+    head(submission_check) %>%
+      kable(caption = "Pierwsze wiersze finalnego pliku submission") %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+  }
+} else {
+  cat("Plik KrukMagdalena_458917_kaggle.R nie został znaleziony w folderze roboczym. Finalny model znajduje się w osobnym skrypcie i należy uruchomić go w tym samym folderze co bike_train.csv, bike_test.csv oraz sample_submission.csv.")
+}
+```
+
+Ostateczny plik wynikowy ma dwie kolumny:
+
+- `date` – data ze zbioru testowego,
+- `pred` – przewidywana liczba wypożyczeń rowerów.
+
+Taki format jest zgodny z plikiem `sample_submission.csv`.
+
+---
+
+# Informacje o sesji
+
+```{r session-info}
+sessionInfo()
+```
